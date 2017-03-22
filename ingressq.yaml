@@ -38,6 +38,8 @@ spec:
             value: kafka-0.broker:9092,kafka-1.broker:9092,kafka-2.broker:9092
           - name: BTRDB_ENDPOINTS
             value: btrdb-bootstrap:4410
+          - name: INGRESSQ_PREFIX
+            value: "bwp"
 ---
 apiVersion: v1
 kind: Service

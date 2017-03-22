@@ -120,7 +120,9 @@ func flush(evz []*sarama.ConsumerMessage) {
 	scnt := 0
 	pcnt := 0
 	thisBatch := make(map[ckey][]btrdb.RawPoint)
+    pfx := os.Getenv("INGRESSQ_PREFIX")
 	fmt.Printf("flush called with %d events\n", len(evz))
+
 	for msgi, msg := range evz {
 		mb := MetricBatch{}
 		dec := gob.NewDecoder(bytes.NewBuffer(msg.Value))
@@ -143,7 +145,7 @@ func flush(evz []*sarama.ConsumerMessage) {
 						lookupTags[tk] = &tv
 					}
 					lookupTags["name"] = &nm
-					cs, err := db.LookupStreams(ctx, m.Collection, false, lookupTags, nil)
+					cs, err := db.LookupStreams(ctx, pfx+m.Collection, false, lookupTags, nil)
 					if err != nil {
 						panic(err)
 					}
@@ -154,7 +156,7 @@ func flush(evz []*sarama.ConsumerMessage) {
 						if !ok {
 							unit = "unknown"
 						}
-						news, err := db.Create(ctx, uu, m.Collection, m.Tags, btrdb.M{"unit": unit})
+						news, err := db.Create(ctx, uu, pfx+m.Collection, m.Tags, btrdb.M{"unit": unit})
 						if err != nil {
 							panic(err)
 						}

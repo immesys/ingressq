@@ -10,12 +10,14 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"strconv"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/Shopify/sarama"
+	influx "github.com/influxdata/influxdb/models"
 )
 
 func main() {
@@ -69,7 +71,7 @@ func main() {
 
 	mux := http.NewServeMux()
 
-	mux.Handle("/lineprotocol", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	mux.Handle("/v1", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		enqueued++
 		handleRequest(w, r, producer)
 	}))
@@ -108,6 +110,37 @@ type MetricBatch struct {
 	Elements []Metric
 }
 
+const MaximumTags = 32
+const MaximumAnnotations = 64
+const MaxTagKeyLength = 64
+const MaxTagValLength = 256
+const MaxAnnKeyLength = 64
+const MaxAnnValLength = 256
+const MaxListCollections = 10000
+const MaxCollectionLength = 256
+
+var tagKeysRegex = regexp.MustCompile(`^[a-z][a-z0-9_.]+$`)
+var annKeysRegex = tagKeysRegex
+
+func isValidTagKey(k string) bool {
+	return len(k) < MaxTagKeyLength && len(k) > 0 && tagKeysRegex.MatchString(k)
+}
+func isValidAnnKey(k string) bool {
+	return len(k) < MaxAnnKeyLength && len(k) > 0 && annKeysRegex.MatchString(k)
+}
+func isValidTagValue(k string) bool {
+	return len(k) < MaxTagValLength && len(k) > 0 && !bytes.Contains([]byte(k), []byte{0})
+}
+func isValidAnnotationValue(k string) bool {
+	return len(k) < MaxAnnValLength
+}
+func isValidCollection(k string) bool {
+	return (len(k) < MaxCollectionLength &&
+		len(k) > 0 &&
+		!bytes.Contains([]byte(k), []byte{0}) &&
+		utf8.Valid([]byte(k)))
+}
+
 func handleRequest(w http.ResponseWriter, r *http.Request, p sarama.AsyncProducer) {
 	msg := MetricBatch{
 		Elements: []Metric{},
@@ -125,53 +158,85 @@ func handleRequest(w http.ResponseWriter, r *http.Request, p sarama.AsyncProduce
 		w.Write([]byte(fmt.Sprintf("error on line %d: %s\n", ln, msg)))
 	}
 	for err == nil {
-		parts := strings.Split(ln, " ")
-		if len(parts) < 2 || len(parts) > 3 {
-			errout(linenum, "invalid line")
+		fmt.Printf("in the loop\n")
+		ipts, err := influx.ParsePointsString(ln)
+		if err != nil {
+			errout(linenum, err.Error())
 			return
 		}
-		timestamp := time.Now().UnixNano()
-		if len(parts) == 3 {
-			ts, err := strconv.ParseInt(parts[2], 10, 64)
-			if err != nil {
-				errout(linenum, "invalid timestamp")
+		//
+		// parts := strings.Split(ln, " ")
+		// if len(parts) < 2 || len(parts) > 3 {
+		// 	errout(linenum, "invalid line")
+		// 	return
+		// }
+		// timestamp := time.Now().UnixNano()
+		// if len(parts) == 3 {
+		// 	ts, err := strconv.ParseInt(parts[2], 10, 64)
+		// 	if err != nil {
+		// 		errout(linenum, "invalid timestamp")
+		// 		return
+		// 	}
+		// 	timestamp = ts
+		// }
+		// fparts := strings.Split(parts[0], ",")
+		// collection := fparts[0]
+		// pkey = collection
+		// tags := make(map[string]string)
+		// for _, p := range fparts[1:] {
+		// 	kvz := strings.Split(p, "=")
+		// 	if len(kvz) != 2 {
+		// 		errout(linenum, "invalid tags")
+		// 		return
+		// 	}
+		// 	tags[kvz[0]] = kvz[1]
+		// }
+		// vals := make(map[string]float64)
+		// vparts := strings.Split(parts[1], ",")
+		// for _, p := range vparts {
+		// 	kvz := strings.Split(p, "=")
+		// 	if len(kvz) != 2 {
+		// 		errout(linenum, "invalid values")
+		// 		return
+		// 	}
+		// 	v, err := strconv.ParseFloat(strings.TrimSpace(kvz[1]), 64)
+		// 	if err != nil {
+		// 		errout(linenum, fmt.Sprintf("could not parse value %q (got %v)", kvz[1], err))
+		// 		return
+		// 	}
+		// 	vals[kvz[0]] = v
+		// }
+
+		for _, p := range ipts {
+			vals := make(map[string]float64)
+			fi := p.FieldIterator()
+			for fi.Next() {
+				v, err := fi.FloatValue()
+				if err != nil {
+					errout(linenum, err.Error())
+					return
+				}
+				vals[string(fi.FieldKey())] = v
+			}
+			tagz := p.Tags().Map()
+			for tk, tv := range tagz {
+				if !isValidTagKey(tk) || !isValidTagValue(tv) {
+					errout(linenum, fmt.Sprintf("invalid BTrDB tag %q=%q\n", tk, tv))
+					return
+				}
+			}
+			if !isValidCollection(p.Name()) {
+				errout(linenum, fmt.Sprintf("invalid BTrDB collection %q\n", p.Name()))
 				return
 			}
-			timestamp = ts
+			msg.Elements = append(msg.Elements, Metric{
+				Collection: p.Name(),
+				Tags:       p.Tags().Map(),
+				Values:     vals,
+				Timestamp:  p.Time().UnixNano(),
+			})
 		}
-		fparts := strings.Split(parts[0], ",")
-		collection := fparts[0]
-		pkey = collection
-		tags := make(map[string]string)
-		for _, p := range fparts[1:] {
-			kvz := strings.Split(p, "=")
-			if len(kvz) != 2 {
-				errout(linenum, "invalid tags")
-				return
-			}
-			tags[kvz[0]] = kvz[1]
-		}
-		vals := make(map[string]float64)
-		vparts := strings.Split(parts[1], ",")
-		for _, p := range vparts {
-			kvz := strings.Split(p, "=")
-			if len(kvz) != 2 {
-				errout(linenum, "invalid values")
-				return
-			}
-			v, err := strconv.ParseFloat(strings.TrimSpace(kvz[1]), 64)
-			if err != nil {
-				errout(linenum, fmt.Sprintf("could not parse value %q (got %v)", kvz[1], err))
-				return
-			}
-			vals[kvz[0]] = v
-		}
-		msg.Elements = append(msg.Elements, Metric{
-			Collection: collection,
-			Tags:       tags,
-			Values:     vals,
-			Timestamp:  timestamp,
-		})
+
 		ln, err = rdr.ReadString('\n')
 		linenum++
 	}
@@ -189,4 +254,5 @@ func handleRequest(w http.ResponseWriter, r *http.Request, p sarama.AsyncProduce
 		Key:   sarama.StringEncoder(pkey),
 		Value: sarama.ByteEncoder(buf.Bytes()),
 	}
+	w.Write([]byte("OK\n"))
 }
