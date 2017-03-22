@@ -18,8 +18,6 @@ import (
 	"github.com/Shopify/sarama"
 )
 
-const KAFKATOPIC = "ingressq/"
-
 func main() {
 	broker := os.Getenv("KAFKA_BROKERS")
 	if broker == "" {
@@ -27,7 +25,7 @@ func main() {
 	}
 	config := sarama.NewConfig()
 	config.Producer.Return.Successes = true
-	brokers := strings.Split("broker", ",")
+	brokers := strings.Split(broker, ",")
 	cl, err := sarama.NewClient(brokers, config)
 	if err != nil {
 		panic(err)
@@ -88,8 +86,9 @@ func main() {
 	<-signals // wait for SIGINT
 	log.Println("Shutting down server...")
 
-	ctx, _ := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	srv.Shutdown(ctx)
+	cancel()
 	log.Println("HTTP done")
 	producer.AsyncClose()
 
@@ -101,6 +100,7 @@ func main() {
 
 type Metric struct {
 	Collection string
+	Timestamp  int64
 	Tags       map[string]string
 	Values     map[string]float64
 }
@@ -112,16 +112,20 @@ func handleRequest(w http.ResponseWriter, r *http.Request, p sarama.AsyncProduce
 	msg := MetricBatch{
 		Elements: []Metric{},
 	}
-	defer r.Body().Close()
-	rdr := bufio.Reader(r.Body())
-	ln, err := rdr.ReadString("\n")
-	linenum = 0
+	defer r.Body.Close()
+	var pkey string
+	// b, e := ioutil.ReadAll(r.Body)
+	// fmt.Printf("r.Body is %s %v\n", string(b), e)
+	rdr := bufio.NewReader(r.Body)
+	ln, err := rdr.ReadString('\n')
+	//fmt.Printf("read %q and %v\n", ln, err)
+	linenum := 0
 	errout := func(ln int, msg string) {
 		w.WriteHeader(400)
 		w.Write([]byte(fmt.Sprintf("error on line %d: %s\n", ln, msg)))
 	}
 	for err == nil {
-		parts = strings.Split(ln, " ")
+		parts := strings.Split(ln, " ")
 		if len(parts) < 2 || len(parts) > 3 {
 			errout(linenum, "invalid line")
 			return
@@ -136,17 +140,53 @@ func handleRequest(w http.ResponseWriter, r *http.Request, p sarama.AsyncProduce
 			timestamp = ts
 		}
 		fparts := strings.Split(parts[0], ",")
-
+		collection := fparts[0]
+		pkey = collection
+		tags := make(map[string]string)
+		for _, p := range fparts[1:] {
+			kvz := strings.Split(p, "=")
+			if len(kvz) != 2 {
+				errout(linenum, "invalid tags")
+				return
+			}
+			tags[kvz[0]] = kvz[1]
+		}
+		vals := make(map[string]float64)
+		vparts := strings.Split(parts[1], ",")
+		for _, p := range vparts {
+			kvz := strings.Split(p, "=")
+			if len(kvz) != 2 {
+				errout(linenum, "invalid values")
+				return
+			}
+			v, err := strconv.ParseFloat(strings.TrimSpace(kvz[1]), 64)
+			if err != nil {
+				errout(linenum, fmt.Sprintf("could not parse value %q (got %v)", kvz[1], err))
+				return
+			}
+			vals[kvz[0]] = v
+		}
+		msg.Elements = append(msg.Elements, Metric{
+			Collection: collection,
+			Tags:       tags,
+			Values:     vals,
+			Timestamp:  timestamp,
+		})
+		ln, err = rdr.ReadString('\n')
 		linenum++
 	}
+	fmt.Printf("finished loop linenum=%d error=%v\n", linenum, err)
+
 	buf := bytes.Buffer{}
 	enc := gob.NewEncoder(&buf) // Will write to network.
-	err := enc.Encode(&msg)
+	err = enc.Encode(&msg)
 	if err != nil {
 		panic(err)
 	}
+	fmt.Printf("wrote message batch with %d elements\n", len(msg.Elements))
 	p.Input() <- &sarama.ProducerMessage{
-		Topic: KAFKATOPIC + "lineprotocol",
+		Topic: "ingressq.lineprotocol",
+		Key:   sarama.StringEncoder(pkey),
 		Value: sarama.ByteEncoder(buf.Bytes()),
 	}
 }

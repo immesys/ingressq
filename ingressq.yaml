@@ -1,0 +1,56 @@
+apiVersion: extensions/v1beta1
+kind: Deployment
+metadata:
+  name: ingressq-frontend
+spec:
+  replicas: 3
+  template:
+    metadata:
+      labels:
+        app: ingressq-frontend
+    spec:
+      containers:
+      - name: ingressq-frontend
+        image: immesys/ingressq-frontend
+        env:
+          - name: KAFKA_BROKERS
+            value: kafka-0.broker:9092,kafka-1.broker:9092,kafka-2.broker:9092
+        ports:
+        - containerPort: 8086
+          protocol: TCP
+---
+apiVersion: extensions/v1beta1
+kind: Deployment
+metadata:
+  name: ingressq-backend
+spec:
+  replicas: 3
+  template:
+    metadata:
+      labels:
+        app: ingressq-backend
+    spec:
+      containers:
+      - name: ingressq-backend
+        image: immesys/ingressq-backend
+        env:
+          - name: KAFKA_BROKERS
+            value: kafka-0.broker:9092,kafka-1.broker:9092,kafka-2.broker:9092
+          - name: BTRDB_ENDPOINTS
+            value: btrdb-bootstrap:4410
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: lineprotocol
+  labels:
+    app: lineprotocol
+spec:
+  ports:
+  - port: 8086
+    targetPort: 8086
+    name: lineproc
+  externalIPs:
+    - 128.32.37.195
+  selector:
+    app: ingressq-frontend
