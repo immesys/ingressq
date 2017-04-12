@@ -10,6 +10,7 @@ import (
 	"os/signal"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	btrdb "gopkg.in/btrdb.v4"
@@ -19,7 +20,7 @@ import (
 	"github.com/wvanbergen/kafka/consumergroup"
 )
 
-const tripLevel = 100
+const tripLevel = 10000
 
 var db *btrdb.BTrDB
 
@@ -52,6 +53,14 @@ func main() {
 	}()
 
 	tmt := time.After(10 * time.Second)
+	eventq := make(chan []*sarama.ConsumerMessage, 10)
+	for i := 0; i < 10; i++ {
+		go func() {
+			for e := range eventq {
+				flush(e)
+			}
+		}()
+	}
 	events := []*sarama.ConsumerMessage{}
 MainLoop:
 	for {
@@ -62,16 +71,16 @@ MainLoop:
 			}
 			events = append(events, ev)
 			if len(events) > tripLevel {
-				flush(events)
+				eventq <- events
 				consumer.CommitUpto(events[len(events)-1])
-				events = events[:0]
+				events = []*sarama.ConsumerMessage{}
 				tmt = time.After(10 * time.Second)
 			}
 		case <-tmt:
 			if len(events) > 0 {
-				flush(events)
+				eventq <- events
 				consumer.CommitUpto(events[len(events)-1])
-				events = events[:0]
+				events = []*sarama.ConsumerMessage{}
 			}
 			tmt = time.After(10 * time.Second)
 		}
@@ -102,6 +111,7 @@ type cval struct {
 
 func init() {
 	streamcache = make(map[ckey]*cval)
+
 }
 
 type Metric struct {
@@ -114,38 +124,50 @@ type MetricBatch struct {
 	Elements []Metric
 }
 
+var scmu sync.Mutex
+var createmu sync.Mutex
+
 func flush(evz []*sarama.ConsumerMessage) {
 	//Establish that the streams exist
 	then := time.Now()
 	scnt := 0
 	pcnt := 0
 	thisBatch := make(map[ckey][]btrdb.RawPoint)
-    pfx := os.Getenv("INGRESSQ_PREFIX")
+	pfx := os.Getenv("INGRESSQ_PREFIX")
 	fmt.Printf("flush called with %d events\n", len(evz))
 
-	for msgi, msg := range evz {
+	for _, msg := range evz {
 		mb := MetricBatch{}
 		dec := gob.NewDecoder(bytes.NewBuffer(msg.Value))
 		err := dec.Decode(&mb)
 		if err != nil {
 			panic(err)
 		}
-		fmt.Printf("event %d has %d metrics\n", msgi, len(mb.Elements))
+		//fmt.Printf("event %d has %d metrics\n", msgi, len(mb.Elements))
 		for _, m := range mb.Elements {
 			for nm, vl := range m.Values {
 				ck := ckey{Collection: m.Collection, Name: nm}
 				ck.SetTagstring(m.Tags)
+				scmu.Lock()
 				_, ok := streamcache[ck]
+				scmu.Unlock()
 				if !ok {
 					ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 					defer cancel()
 					var s *btrdb.Stream
+					streamTags := make(map[string]string)
 					lookupTags := make(map[string]*string)
 					for tk, tv := range m.Tags {
-						lookupTags[tk] = &tv
+						tvc := tv
+						lookupTags[tk] = &tvc
+						streamTags[tk] = tv
 					}
 					lookupTags["name"] = &nm
-					cs, err := db.LookupStreams(ctx, pfx+m.Collection, false, lookupTags, nil)
+					streamTags["name"] = nm
+					coll := pfx + m.Collection
+					//	fmt.Printf("doing lookup col=%q tags=%#v\n", coll, lookupTags)
+                    createmu.Lock()
+					cs, err := db.LookupStreams(ctx, coll, false, lookupTags, nil)
 					if err != nil {
 						panic(err)
 					}
@@ -156,16 +178,21 @@ func flush(evz []*sarama.ConsumerMessage) {
 						if !ok {
 							unit = "unknown"
 						}
-						news, err := db.Create(ctx, uu, pfx+m.Collection, m.Tags, btrdb.M{"unit": unit})
+						//	fmt.Printf("doing create col=%q tags=%#v\n", coll, streamTags)
+						news, err := db.Create(ctx, uu, coll, streamTags, btrdb.M{"unit": unit})
 						if err != nil {
 							panic(err)
 						}
+                        createmu.Unlock()
 						s = news
 					} else {
+                        createmu.Unlock()
 						s = cs[0]
 					}
 					cv := &cval{S: s}
+					scmu.Lock()
 					streamcache[ck] = cv
+					scmu.Unlock()
 				}
 				//We now have CV
 				lst := thisBatch[ck]
@@ -178,11 +205,21 @@ func flush(evz []*sarama.ConsumerMessage) {
 	//Iterate over thisBatch and insert
 	for ck, list := range thisBatch {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		scmu.Lock()
 		stream := streamcache[ck]
+		scmu.Unlock()
+		ithen := time.Now()
+		col, _ := stream.S.Collection(ctx)
+		fmt.Printf("%s : Inserting %d into %s\n", ithen, len(list), col)
 		err := stream.S.Insert(ctx, list)
 		if err != nil {
 			panic(err)
 		}
+		nw := time.Now()
+		fmt.Printf("%s : insert done in %s\n", nw, nw.Sub(ithen))
+		stream.S.Flush(ctx)
+		nw2 := time.Now()
+		fmt.Printf("%s : flush done in %s\n", nw2, nw2.Sub(nw))
 		pcnt += len(list)
 		scnt += 1
 		cancel()
